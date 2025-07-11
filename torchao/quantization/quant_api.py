@@ -1629,6 +1629,7 @@ class Float8DynamicActivationFloat8WeightConfig(AOBaseConfig):
     mm_config: Optional[Float8MMConfig] = None
     set_inductor_config: bool = True
     layout: Optional[Layout] = None
+    device: Optional[str] = "cuda"
 
     def __post_init__(self):
         if self.layout is None:
@@ -1637,7 +1638,7 @@ class Float8DynamicActivationFloat8WeightConfig(AOBaseConfig):
             self.layout = Float8Layout(self.mm_config)
 
         activation_granularity, weight_granularity = _normalize_granularity(
-            self.granularity
+            self.granularity, self.device
         )
         self.granularity = [activation_granularity, weight_granularity]
 
@@ -1654,13 +1655,7 @@ def _float8_dynamic_activation_float8_weight_quantize_tensor(weight, config):
     # Ensure works on device
     activation_granularity, weight_granularity = granularity
     is_cpu = weight.device.type == "cpu"
-    if is_cpu:
-        assert not (
-            isinstance(activation_granularity, PerTensor)
-            or isinstance(weight_granularity, PerTensor)
-        ), "PerTensor quantization is not supported for CPU float8 quantization"
-    else:
-        _check_hardware_support(granularity)
+    _check_hardware_support(granularity, weight.device.type)
 
     if not is_cpu and not _fp8_mm_compat(weight):
         # TODO(future PR): this should really throw an exception instead of silently
@@ -1671,7 +1666,11 @@ def _float8_dynamic_activation_float8_weight_quantize_tensor(weight, config):
             "PerRow quantization only works for bfloat16 precision input weight"
         )
 
-    block_size = get_block_size(weight.shape[-2:], weight_granularity)
+    if not isinstance(weight_granularity, PerGroup):
+        block_size = get_block_size(weight.shape[-2:], weight_granularity)
+    else:
+        group_size = weight_granularity.group_size
+        block_size = (1, group_size)
     if weight.dim() == 3:
         block_size = tuple([1] + list(block_size))
     quantized_weight = to_affine_quantized_floatx(

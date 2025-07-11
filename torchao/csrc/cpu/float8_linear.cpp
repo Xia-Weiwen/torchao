@@ -17,7 +17,11 @@ bool cpublas_could_pack() {
   if (cpublas_checked) {
     return cpublas_can_pack;
   }
+#ifdef CPUBLAS_BRGEMM_F8F8BF16
+  cpublas_can_pack = at::native::cpublas::could_pack(at::kFloat8_e4m3fn);
+#else
   cpublas_can_pack = at::native::cpublas::could_pack(at::kBFloat16);
+#endif
   cpublas_checked = true;
   return cpublas_can_pack;
 }
@@ -64,7 +68,11 @@ float8_linear_prepack_impl(
 
 #if defined(CPU_CAPABILITY_AVX512)
   if (cpublas_could_pack()) {
+#ifdef CPUBLAS_BRGEMM_F8F8BF16
+    constexpr int vnni_size = 4; // for fp8
+#else
     constexpr int vnni_size = 2; // for float16
+#endif
     blocked_weight = at::empty({Nc, Kc, block_k, block_n}, weight.options());
     auto weight_ptr = reinterpret_cast<uint8_t*>(weight_reordered.data_ptr());
     auto blocked_weight_ptr = reinterpret_cast<uint8_t*>(blocked_weight.data_ptr());
@@ -265,13 +273,29 @@ void _dequant_gemm_accum(
     int64_t ldc) {
   // Compute GEMM fp8 * fp8 -> fp32
   // Then apply scales and store results
+#ifndef CPUBLAS_BRGEMM_F8F8BF16
   at::BFloat16 dqB[K * N];
   _convert_B_to_bf16(B, dqB, K * N);
   at::BFloat16 dqA[M * K];
   _convert_A_to_bf16(A, dqA, M, K, lda);
+#endif
 #if defined(CPU_CAPABILITY_AVX512)
   if constexpr (cpublas_can_pack) {
     float C_f32[M * N];
+#ifdef CPUBLAS_BRGEMM_F8F8BF16
+    at::native::cpublas::brgemm(
+        M,
+        N,
+        K,
+        lda /*lda*/,
+        N /*ldb*/,
+        N /*ldc*/,
+        false /* add_C */,
+        A,
+        B,
+        C_f32,
+        true /* is_vnni */);
+#else
     at::native::cpublas::brgemm(
         M,
         N,
@@ -284,6 +308,7 @@ void _dequant_gemm_accum(
         dqB,
         C_f32,
         true /* is_vnni */);
+#endif
     _mm_prefetch(B + N * K, _MM_HINT_T0);
     _mm_prefetch(A + K, _MM_HINT_T0);
     _dequant_and_store<true, N>(
@@ -302,7 +327,11 @@ void _dequant_gemm_accum(
       for (int64_t j = 0; j < N; ++j) {
         float sum = 0;
         for (int64_t k = 0; k < K; ++k) {
+#ifdef CPUBLAS_BRGEMM_F8F8BF16
+          sum += ((float)A[i * lda + k] * (float)B[k * N + j]);
+#else
           sum += ((float)dqA[i * K + k] * dqB[k * N + j]);
+#endif
         }
         C[i * ldc + j] += sum * scales_a[i] * scales_b[j];
       }
