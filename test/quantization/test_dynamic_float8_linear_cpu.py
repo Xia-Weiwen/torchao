@@ -212,6 +212,65 @@ class TestDynamicFloat8Linear(TestCase):
             assert torch.allclose(dqw1, dqw1_ref)
             assert torch.allclose(dqw2, dqw2_ref)
 
+    @unittest.skipIf(
+        "CPU" not in torch._C._dispatch_dump("torchao::float8_linear_cpu"),
+        reason="cpp kernels not built",
+    )
+    @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_6, "Test only enabled for 2.6+")
+    @common_utils.parametrize("dtype", [torch.bfloat16, torch.half])
+    @common_utils.parametrize("x_dim", [2, 3])
+    @common_utils.parametrize("bias", [True, False])
+    @common_utils.parametrize("bs", [1, 160])
+    @common_utils.parametrize("group_size", [32, 64, 128])
+    def test_dynamic_float8_linear_per_group_act_cpu(
+        self, dtype, x_dim, bias, bs, group_size
+    ):
+        device = "cpu"
+        m = ToyLinearModel(256, 256, bias=bias).eval().to(dtype).to(device)
+        m2 = copy.deepcopy(m)
+        example_inputs = m.example_inputs(batch_size=bs, dtype=dtype, device=device)
+        if x_dim == 3:
+            example_inputs = (example_inputs[0].unsqueeze(0),)
+
+        with torch.no_grad():
+            quantize_(
+                m,
+                Float8DynamicActivationFloat8WeightConfig(
+                    granularity=[PerGroup(group_size), PerGroup(group_size)],
+                    layout=Float8DynamicActFloat8WeightCPULayout(),
+                    device="cpu",
+                ),
+            )
+            y, code = torch._inductor.utils.run_and_get_code(
+                torch.compile(m, fullgraph=True, dynamic=True),
+                *example_inputs,
+            )
+            # ensure the expected op is in the code
+            assert "torch.ops.torchao.float8_linear_cpu.default" in code[0]
+            quantize_(
+                m2,
+                Float8DynamicActivationFloat8WeightConfig(
+                    granularity=[PerGroup(group_size), PerGroup(group_size)],
+                    layout=PlainLayout(),
+                    device="cpu",
+                ),
+            )
+            torch._dynamo.reset()  # may segfault without this
+            y2 = torch.compile(m2, fullgraph=True, dynamic=True)(*example_inputs)
+            atol, rtol = 1e-4, 1e-6
+            if dtype == torch.bfloat16:
+                atol, rtol = 1.6e-2, 3e-3
+            elif dtype == torch.half:
+                atol, rtol = 6e-3, 2e-3
+            assert torch.allclose(y, y2, atol=atol, rtol=rtol)
+            # Test get_plain by dequantize()
+            dqw1 = m.linear1.weight.original_weight_tensor.dequantize()
+            dqw2 = m.linear2.weight.original_weight_tensor.dequantize()
+            dqw1_ref = m2.linear1.weight.original_weight_tensor.dequantize()
+            dqw2_ref = m2.linear2.weight.original_weight_tensor.dequantize()
+            assert torch.allclose(dqw1, dqw1_ref)
+            assert torch.allclose(dqw2, dqw2_ref)
+
 
 common_utils.instantiate_parametrized_tests(TestDynamicFloat8Linear)
 

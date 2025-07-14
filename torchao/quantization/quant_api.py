@@ -1568,7 +1568,11 @@ def _input_activation_quant_cpu_fp8(
     activation_dtype: torch.dtype,
 ):
     """Dynamic quantize activation to fp8 for CPU."""
-    block_size = get_block_size(x.shape, activation_granularity)
+    if not isinstance(activation_granularity, PerGroup):
+        block_size = get_block_size(x.shape, activation_granularity)
+    else:
+        group_size = activation_granularity.group_size
+        block_size = (*([1] * (len(x.shape) - 1)), group_size)
     return to_affine_quantized_floatx(
         input_float=x,
         block_size=block_size,

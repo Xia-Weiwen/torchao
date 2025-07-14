@@ -272,7 +272,8 @@ void _dequant_gemm_accum(
     int64_t M,
     int64_t K,
     int64_t lda,
-    int64_t ldc) {
+    int64_t ldc,
+    int64_t ldsa) {
   // Compute GEMM fp8 * fp8 -> fp32
   // Then apply scales and store results
 #ifndef CPUBLAS_BRGEMM_F8F8BF16
@@ -321,7 +322,7 @@ void _dequant_gemm_accum(
         M,
         N /*ldi*/,
         ldc,
-        1 /*ldsa*/);
+        ldsa);
   } else
 #endif
   {
@@ -432,7 +433,6 @@ void _float8_linear_impl(
   int64_t K = input.size(-1);
   auto input_view = input.view({-1, K});
   int64_t M = input_view.size(0);
-  TORCH_CHECK(input_scales.numel() == M, "Float8 linear: unexpected input scales shape");
 
   // weight shape = [Nc, Kc, block_k, block_n]
   // scales shape = [Nc, G, block_n]
@@ -465,6 +465,8 @@ void _float8_linear_impl(
   TORCH_CHECK(group_size % block_k == 0,
               "Float8 linear: group_size should be divisible by block_k");
   int64_t block_per_group = group_size / block_k;
+  TORCH_CHECK(input_scales.numel() == M || input_scales.numel() == M * num_groups, "Float8 linear: unexpected input scales shape");
+  bool input_scales_is_per_token = input_scales.numel() == M;
 
   const at::Float8_e4m3fn* a_ptr = input_view.data_ptr<at::Float8_e4m3fn>();
   const float* a_scales_ptr = input_scales.data_ptr<float>();
@@ -486,16 +488,20 @@ void _float8_linear_impl(
         auto bias_data = bias_ptr ? bias_ptr + nc * block_n : nullptr;
         copy_bias<block_n>(bias_data, y_buf[0], m_size);
         for (int kci = 0; kci < Kc; ++kci) {
+          auto scales_a = input_scales_is_per_token ? a_scales_ptr + mci * block_m :
+            a_scales_ptr + mci * block_m * num_groups + kci / block_per_group;
+          auto ldsa = input_scales_is_per_token ? 1 : num_groups;
           _dequant_gemm_accum<cpublas_can_pack, block_n>(
             y_buf[0] /*C*/,
             a_ptr + mci * block_m * K + kci * block_k /*A*/,
-            a_scales_ptr + mci * block_m /*scales_a*/,
+            scales_a /*scales_a*/,
             b_ptr + (nc * Kc + kci) * block_n * block_k /*B*/,
             b_scales_ptr + nc * block_n * num_groups + kci / block_per_group * block_n /*scales_b*/,
             m_size /*M*/,
             block_k /*K*/,
             K /*lda*/,
-            block_n /*ldc*/);
+            block_n /*ldc*/,
+            ldsa /*ldsa*/);
         }
         // store y_buf to output with dtype conversion
         store_out<out_dtype, block_n>(
