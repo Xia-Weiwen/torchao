@@ -127,7 +127,7 @@ def _normalize_granularity(
     device: str = "cuda",
 ) -> Tuple[FP8Granularity, FP8Granularity]:
     supported_granularities = (
-        (PerRow, PerGroup) if device == "cpu" else (PerTensor, PerRow)
+        (PerTensor, PerRow, PerGroup) if device == "cpu" else (PerTensor, PerRow)
     )
     processed_granularity = None
     if granularity is None:
@@ -169,7 +169,7 @@ def _check_hardware_support(
         ValueError: If invalid granularity type is provided
     """
     supported_granularities = (
-        (PerRow, PerGroup) if device == "cpu" else (PerTensor, PerRow)
+        (PerTensor, PerRow, PerGroup) if device == "cpu" else (PerTensor, PerRow)
     )
     for _granularity in granularities:
         if not isinstance(_granularity, supported_granularities):

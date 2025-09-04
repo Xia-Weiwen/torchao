@@ -206,7 +206,7 @@ class Float8DynActFloat8WeiCpuAQTTensorImpl(AQTTensorImpl):
         plain_weight = plain_weight.t().contiguous()
         plain_weight = plain_weight.to(torch.float8_e4m3fn)
 
-        if self.scales.dim() == 2:
+        if self.scales.dim() <= 2:
             plain_scales = self.scales
         else:
             assert self.scales.dim() == 3
@@ -246,9 +246,6 @@ def _float8_linear_cpu_impl(input_tensor, weight_tensor, bias):
     )
     assert is_device(input_tensor.device.type, "cpu"), (
         f"For CPU device only but got: {input_tensor.device}"
-    )
-    assert weight_tensor.block_size[0] == 1, (
-        f"Requires groupwise quantization, got block_size: {weight_tensor.block_size}"
     )
     assert input_tensor.shape[-1] == weight_tensor.shape[1], (
         f"need input_tensor shape: {input_tensor.shape} final"
