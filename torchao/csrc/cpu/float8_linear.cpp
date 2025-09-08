@@ -206,8 +206,10 @@ static void _convert_A_to_bf16(
   }
 }
 
+// accumulate and store result to buffer
+// if act/wei are per_group quantized, apply scales
 template <bool accum, int64_t N, int act_quant_mode, int wei_quant_mode>
-static void _dequant_and_store(
+static void _store_result(
     float* __restrict__ output,
     const float* __restrict__ input,
     const float* __restrict__ scale_a,
@@ -218,17 +220,9 @@ static void _dequant_and_store(
     int ldsa = 1) {
   float a_scale, b_scale;
   __m512 va_scale;
-  __m512 vb_s;
-  if constexpr (act_quant_mode == PER_TENSOR) {
-    a_scale = *scale_a;
-    va_scale = _mm512_set1_ps(a_scale);
-  }
-  if constexpr (wei_quant_mode == PER_TENSOR) {
-    b_scale = *scale_b;
-    vb_s = _mm512_set1_ps(b_scale);
-  }
+  __m512 vb_scale;
   for (int m = 0; m < M; ++m) {
-    if constexpr (act_quant_mode != PER_TENSOR) {
+    if constexpr (act_quant_mode == PER_GROUP) {
       a_scale = *(scale_a + m * ldsa);
       va_scale = _mm512_set1_ps(a_scale);
     }
@@ -236,23 +230,29 @@ static void _dequant_and_store(
 #pragma GCC unroll 2
     for (; n < N; n += 16) {
       __m512 vc_f = _mm512_loadu_ps(input + m * ldi + n);
-      __m512 vc_f_mul = _mm512_mul_ps(vc_f, va_scale);
-      if constexpr (wei_quant_mode != PER_TENSOR) {
-        vb_s = _mm512_loadu_ps(scale_b + n);
+      if constexpr (act_quant_mode == PER_GROUP) {
+        vc_f = _mm512_mul_ps(vc_f, va_scale);
       }
-      vc_f_mul = _mm512_mul_ps(vc_f_mul, vb_s);
+      if constexpr (wei_quant_mode == PER_GROUP) {
+        vb_scale = _mm512_loadu_ps(scale_b + n);
+        vc_f = _mm512_mul_ps(vc_f, vb_scale);
+      }
       if constexpr (accum) {
         __m512 vo = _mm512_loadu_ps(output + m * ldo + n);
-        _mm512_storeu_ps(output + m * ldo + n, _mm512_add_ps(vo, vc_f_mul));
+        _mm512_storeu_ps(output + m * ldo + n, _mm512_add_ps(vo, vc_f));
       } else {
-        _mm512_storeu_ps(output + m * ldo + n, vc_f_mul);
+        _mm512_storeu_ps(output + m * ldo + n, vc_f);
       }
     }
     for (; n < N; ++n) {
-      if constexpr (wei_quant_mode != PER_TENSOR) {
-        b_scale = scale_b[n];
+      float dq_val = input[m * ldi + n];
+      if constexpr (act_quant_mode == PER_GROUP) {
+        dq_val = dq_val * a_scale;
       }
-      float dq_val = input[m * ldi + n] * (a_scale * b_scale);
+      if constexpr (wei_quant_mode == PER_GROUP) {
+        b_scale = scale_b[n];
+        dq_val = dq_val * b_scale;
+      }
       if constexpr (accum) {
         output[m * ldo + n] += dq_val;
       } else {
@@ -287,7 +287,7 @@ static void _convert_A_to_bf16(
 #endif
 
 template <bool cpublas_can_pack, int64_t N, int act_quant_mode, int wei_quant_mode>
-void _dequant_gemm_accum(
+void _micro_gemm(
     float* C,
     const at::Float8_e4m3fn* A,
     const float* scales_a,
@@ -298,8 +298,10 @@ void _dequant_gemm_accum(
     int64_t lda,
     int64_t ldc,
     int64_t ldsa) {
-  // Compute GEMM fp8 * fp8 -> fp32
-  // Then apply scales and store results
+  // If FP8 brgemm is not available, convert A/B to bf16 for computation
+  // Compute GEMM fp8 * fp8 -> fp32 (or bf16 * bf16 -> fp32)
+  // If per_group quant, apply scales. Otherwise, don't apply scales here
+  // Finally accumulate and store results
 #ifndef CPUBLAS_BRGEMM_F8F8F32
   at::BFloat16 dqB[K * N];
   _convert_B_to_bf16(B, dqB, K * N);
@@ -338,7 +340,7 @@ void _dequant_gemm_accum(
 #endif
     _mm_prefetch(B + N * K, _MM_HINT_T0);
     _mm_prefetch(A + K, _MM_HINT_T0);
-    _dequant_and_store<true, N, act_quant_mode, wei_quant_mode>(
+    _store_result<true, N, act_quant_mode, wei_quant_mode>(
         C,
         C_f32,
         scales_a,
@@ -350,21 +352,8 @@ void _dequant_gemm_accum(
   } else
 #endif
   {
-    float scale_a, scale_b;
-    if constexpr (act_quant_mode == PER_TENSOR) {
-      scale_a = *scales_a;
-    }
-    if constexpr (wei_quant_mode == PER_TENSOR) {
-      scale_b = *scales_b;
-    }
     for (int64_t i = 0; i < M; ++i) {
-      if constexpr (act_quant_mode == PER_ROW) {
-        scale_a = scales_a[i];
-      }
       for (int64_t j = 0; j < N; ++j) {
-        if constexpr (wei_quant_mode == PER_ROW) {
-          scale_b = scales_b[j];
-        }
         float sum = 0;
         for (int64_t k = 0; k < K; ++k) {
 #ifdef CPUBLAS_BRGEMM_F8F8F32
@@ -374,93 +363,86 @@ void _dequant_gemm_accum(
 #endif
         }
         if constexpr (act_quant_mode == PER_GROUP) {
-          scale_a = scales_a[i * ldsa];
+          sum *= scales_a[i * ldsa];
         }
         if constexpr (wei_quant_mode == PER_GROUP) {
-          scale_b = scales_b[j];
+          sum *= scales_b[j];
         }
-        C[i * ldc + j] += sum * scale_a * scale_b;
+        C[i * ldc + j] += sum;
       }
     }
   }
 }
 
-template<int64_t N>
-inline void copy_bias(const float* bias_ptr, float* y_buf, int64_t m) {
-  if (bias_ptr) {
-    for (int i = 0; i < m; ++i) {
-      int j = 0;
+// Store result to output buffer with dtype conversion
+// If act/wei are per_row or per_tensor quantized, apply scales
+// If bias is not null, add bias
+template<typename out_dtype, int64_t N, int act_quant_mode, int wei_quant_mode>
+inline void store_out(
+    const float* y_buf,
+    out_dtype* c_ptr,
+    int64_t M,
+    int64_t lda,
+    const float* scales_a,
+    const float* scales_b,
+    const float* bias) {
+  float a_scale = 1.0, b_scale = 1.0;
 #if defined(CPU_CAPABILITY_AVX512)
-#pragma GCC unroll 2
-      for (; j < N; j += 16) {
-        __m512 bias_vec = _mm512_loadu_ps(bias_ptr + j);
-        _mm512_storeu_ps(y_buf + i * N + j, bias_vec);
-      }
+    __m512 va_scale, vb_scale;
 #endif
-      for (; j < N; ++j) {
-        y_buf[i * N + j] = bias_ptr[j];
-      }
-    }
-  } else { // initialize to zero
-    for (int i = 0; i < m; ++i) {
-      int j = 0;
-#if defined(CPU_CAPABILITY_AVX512)
-#pragma GCC unroll 2
-      for (; j < N; j += 16) {
-        __m512 zero_vec = _mm512_setzero_ps();
-        _mm512_storeu_ps(y_buf + i * N + j, zero_vec);
-      }
-#endif
-      for (; j < N; ++j) {
-        y_buf[i * N + j] = 0;
-      }
-    }
+  if constexpr (act_quant_mode == PER_TENSOR) {
+    a_scale = *scales_a;
   }
-}
-
-template<typename out_dtype, int64_t N>
-inline void store_out(const float* y_buf, out_dtype* c_ptr, int64_t m, /* int64_t n, */ int64_t lda) {
-  for (int i = 0; i < m; ++i) {
+  if constexpr (wei_quant_mode == PER_TENSOR) {
+    b_scale = *scales_b;
+#if defined(CPU_CAPABILITY_AVX512)
+    vb_scale = _mm512_set1_ps(b_scale);
+#endif
+  }
+  for (int i = 0; i < M; ++i) {
+    if constexpr (act_quant_mode == PER_ROW) {
+      a_scale = *(scales_a + i);
+    }
     int j = 0;
-    if constexpr (std::is_same<out_dtype, float>::value) {
 #if defined(CPU_CAPABILITY_AVX512)
+    if constexpr (act_quant_mode != PER_GROUP) {
+      va_scale = _mm512_set1_ps(a_scale);
+    }
 #pragma GCC unroll 2
-      for (; j < N; j += 16) {
-        __m512 y_vec = _mm512_loadu_ps(y_buf + i * N + j);
+    for (; j < N; j += 16) {
+      __m512 y_vec = _mm512_loadu_ps(y_buf + i * N + j);
+      __m512 bias_vec = bias ? _mm512_loadu_ps(bias + j) : _mm512_setzero_ps();
+      if constexpr (act_quant_mode != PER_GROUP) {
+        y_vec = _mm512_mul_ps(y_vec, va_scale);
+      }
+      if constexpr (wei_quant_mode == PER_ROW) {
+        vb_scale = _mm512_loadu_ps(scales_b + j);
+      }
+      if constexpr (wei_quant_mode != PER_GROUP) {
+        y_vec = _mm512_mul_ps(y_vec, vb_scale);
+      }
+      y_vec = _mm512_add_ps(y_vec, bias_vec);
+      if constexpr (std::is_same<out_dtype, float>::value) {
         _mm512_storeu_ps(c_ptr + i * lda + j, y_vec);
-      }
-#endif
-      for (; j < N; ++j) {
-        c_ptr[i * lda + j] = y_buf[i * N + j];
-      }
-    } else if constexpr (std::is_same<out_dtype, at::BFloat16>::value) {
-#if defined(CPU_CAPABILITY_AVX512)
-#pragma GCC unroll 2
-      for (; j < N; j += 16) {
-        __m512 y_vec = _mm512_loadu_ps(y_buf + i * N + j);
+      } else if constexpr (std::is_same<out_dtype, at::BFloat16>::value) {
         __m256i y_bf16_vec = at::vec::cvtfp32_bf16(y_vec);
         _mm256_storeu_si256(reinterpret_cast<__m256i*>(c_ptr + i * lda + j), y_bf16_vec);
-      }
-#endif
-      for (; j < N; ++j) {
-        c_ptr[i * lda + j] = at::BFloat16(y_buf[i * N + j]);
-      }
-    } else if constexpr (std::is_same<out_dtype, at::Half>::value) {
-#if defined(CPU_CAPABILITY_AVX512)
-#pragma GCC unroll 2
-      for (; j < N; j += 16) {
-        __m512 y_vec = _mm512_loadu_ps(y_buf + i * N + j);
+      } else if constexpr (std::is_same<out_dtype, at::Half>::value) {
         __m256i y_fp16_vec = at::vec::cvtfp32_fp16(y_vec);
         _mm256_storeu_si256(reinterpret_cast<__m256i*>(c_ptr + i * lda + j), y_fp16_vec);
+      } else {
+        TORCH_CHECK(false, "Unsupported output dtype");
       }
-#endif
-      for (; j < N; ++j) {
-        c_ptr[i * lda + j] = at::Half(y_buf[i * N + j]);
-      }
-    } else {
-      TORCH_CHECK(false, "Unsupported output dtype");
     }
-  }
+#else
+    for (; j < N; ++j) {
+      if constexpr (wei_quant_mode == PER_ROW) {
+        b_scale = scales_b[j];
+      }
+      c_ptr[i * lda + j] = static_cast<out_dtype>(y_buf[i * N + j] * a_scale * b_scale);
+    }
+#endif
+  } // for M
 }
 
 template<typename out_dtype, bool cpublas_can_pack, int act_quant_mode, int wei_quant_mode>
@@ -526,18 +508,11 @@ void _float8_linear_impl(
 
       for (int mci = mc; mci < mc_end; ++mci) {
         int64_t m_size = mci * block_m + block_m > M ? M - mci * block_m : block_m;
-        alignas(64) float y_buf[m_size][block_n];
-        // copy bias to y_buf if bias is not None
-        auto bias_data = bias_ptr ? bias_ptr + nc * block_n : nullptr;
-        copy_bias<block_n>(bias_data, y_buf[0], m_size);
+        alignas(64) float y_buf[m_size][block_n] = {0};
         for (int kci = 0; kci < Kc; ++kci) {
-          auto scales_a = act_quant_mode == PER_TENSOR ? a_scales_ptr :
-            act_quant_mode == PER_ROW ? a_scales_ptr + mci * block_m :
-            a_scales_ptr + mci * block_m * num_groups + kci / block_per_group;
-          auto scales_b = wei_quant_mode == PER_TENSOR ? b_scales_ptr :
-            wei_quant_mode == PER_ROW ? b_scales_ptr + nc * block_n :
-            b_scales_ptr + nc * block_n * num_groups + kci / block_per_group * block_n;
-          _dequant_gemm_accum<cpublas_can_pack, block_n, act_quant_mode, wei_quant_mode>(
+          auto scales_a = a_scales_ptr + mci * block_m * num_groups + kci / block_per_group;
+          auto scales_b = b_scales_ptr + nc * block_n * num_groups + kci / block_per_group * block_n;
+          _micro_gemm<cpublas_can_pack, block_n, act_quant_mode, wei_quant_mode>(
             y_buf[0] /*C*/,
             a_ptr + mci * block_m * K + kci * block_k /*A*/,
             scales_a /*scales_a*/,
@@ -550,11 +525,19 @@ void _float8_linear_impl(
             ldsa /*ldsa*/);
         }
         // store y_buf to output with dtype conversion
-        store_out<out_dtype, block_n>(
+        auto scales_a = act_quant_mode == PER_TENSOR ? a_scales_ptr :
+            act_quant_mode == PER_ROW ? a_scales_ptr + mci * block_m : nullptr;
+        auto scales_b = wei_quant_mode == PER_TENSOR ? b_scales_ptr :
+          wei_quant_mode == PER_ROW ? b_scales_ptr + nc * block_n : nullptr;
+        auto bias_data = bias_ptr ? bias_ptr + nc * block_n : nullptr;
+        store_out<out_dtype, block_n, act_quant_mode, wei_quant_mode>(
           y_buf[0],
           c_ptr + mci * block_m * N + nc * block_n,
           m_size,
-          N /*lda*/);
+          N /*lda*/,
+          scales_a,
+          scales_b,
+          bias_data);
       }
     }
     if constexpr (cpublas_can_pack) {
