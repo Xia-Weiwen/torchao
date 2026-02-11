@@ -20,7 +20,6 @@ from torch._inductor.utils import run_and_get_code
 from torch.testing import FileCheck
 
 import torchao
-from torchao.dtypes import Int4CPULayout, Int4XPULayout, TensorCoreTiledLayout
 from torchao.quantization import safe_int_mm
 from torchao.quantization.autoquant import (
     AQFloat8PerRowScalingDynamicallyQuantizedLinearWeight,
@@ -28,7 +27,6 @@ from torchao.quantization.autoquant import (
     AQFloat8WeightOnlyQuantizedLinearWeight,
     AQGemliteInt4G64WeightOnlyQuantizedLinearWeight,
     AQInt4G32WeightOnlyQuantizedLinearWeight,
-    AQInt4G128WeightOnlyQuantizedMarlinSparseLinearWeight,
     AQInt8DynamicallyQuantizedLinearWeight,
     AQInt8WeightOnlyQuantizedLinearWeight,
     AQInt8WeightOnlyQuantizedLinearWeight2,
@@ -49,6 +47,9 @@ from torchao.quantization.quant_primitives import (
     MappingType,
     dequantize_affine,
 )
+from torchao.quantization.quantize_.workflows.int4.int4_packing_format import (
+    Int4PackingFormat,
+)
 from torchao.quantization.utils import (
     LoggingTensorMode,
     _apply_logging_hook,
@@ -65,8 +66,6 @@ from torchao.quantization.utils import (
 from torchao.testing.utils import skip_if_rocm, skip_if_xpu
 from torchao.utils import (
     benchmark_model,
-    check_cpu_version,
-    check_xpu_version,
     get_current_accelerator_device,
     is_fbcode,
     is_sm_at_least_89,
@@ -87,9 +86,10 @@ logger = logging.getLogger("INFO")
 
 torch.manual_seed(0)
 config.cache_size_limit = 100
-_DEVICE = get_current_accelerator_device()
 
-COMMON_DEVICES = ["cpu", _DEVICE]
+COMMON_DEVICES = ["cpu"] + (
+    [get_current_accelerator_device()] if torch.accelerator.is_available() else []
+)
 
 COMMON_DTYPES = [torch.float32, torch.float16, torch.bfloat16]
 
@@ -122,30 +122,6 @@ def _int8da_int8w_api(
     )
 
 
-def _int4wo_api(mod, use_hqq=False):
-    if check_cpu_version(next(mod.parameters()).device):
-        quantize_(
-            mod,
-            Int4WeightOnlyConfig(
-                layout=Int4CPULayout(),
-                use_hqq=use_hqq,
-                set_inductor_config=False,
-                version=1,
-            ),
-        )
-        unwrap_tensor_subclass(mod)
-    elif check_xpu_version(next(mod.parameters()).device):
-        quantize_(
-            mod,
-            Int4WeightOnlyConfig(
-                layout=Int4XPULayout(), set_inductor_config=False, version=1
-            ),
-        )
-        unwrap_tensor_subclass(mod)
-    else:
-        quantize_(mod, Int4WeightOnlyConfig(set_inductor_config=False, version=1))
-
-
 def _int8da_int4w_api(mod):
     quantize_(mod, Int8DynamicActivationInt4WeightConfig(set_inductor_config=False))
 
@@ -154,7 +130,6 @@ def _int8da_int4w_api(mod):
 TENSOR_SUBCLASS_APIS = [
     _int8wo_api,
     _int8da_int8w_api,
-    _int4wo_api,
 ]
 
 
@@ -179,6 +154,7 @@ def run_supported_device_dtype(test_method):
     there is a `test_dtype` kwarg or the 4th arg (args[3]) that indicates the dtype for testing
     """
 
+    @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
     def wrapper(*args, **kwargs):
         if len(args) < 3:
             raise unittest.SkipTest(
@@ -186,8 +162,7 @@ def run_supported_device_dtype(test_method):
             )
         device = args[2]
         dtype = kwargs["test_dtype"] if "test_dtype" in kwargs else args[3]
-        if device == _DEVICE and not torch.accelerator.is_available():
-            raise unittest.SkipTest("Need GPU available.")
+        _DEVICE = get_current_accelerator_device()
         if (
             device == _DEVICE
             and torch.cuda.is_available()
@@ -264,9 +239,10 @@ class PythonQuantUtilOpUnitTest(unittest.TestCase):
     @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
     @unittest.skip("AssertionError: Tensor-likes are not close!")
     def test_dynamic_quant_per_channel_numerics_cuda(self):
+        device = get_current_accelerator_device()
         test_cases = (
-            (-128, 127, torch.int8, torch.qint8, torch.float32, _DEVICE),
-            (-128, 127, torch.int8, torch.qint8, torch.float16, _DEVICE),
+            (-128, 127, torch.int8, torch.qint8, torch.float32, device),
+            (-128, 127, torch.int8, torch.qint8, torch.float16, device),
         )
         for row in test_cases:
             self._test_dynamic_quant_per_channel_numerics_impl(*row)
@@ -287,8 +263,9 @@ class PythonQuantUtilOpUnitTest(unittest.TestCase):
 
     @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
     def test_quantize_per_token_cuda(self):
+        device = get_current_accelerator_device()
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
-            self._test_quantize_per_token_impl(_DEVICE, dtype)
+            self._test_quantize_per_token_impl(device, dtype)
 
     def _test_per_token_linear_impl(self, device, dtype):
         x = torch.randn(2, 16, 8, device=device, dtype=dtype)
@@ -311,8 +288,9 @@ class PythonQuantUtilOpUnitTest(unittest.TestCase):
     @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
     @skip_if_rocm("ROCm enablement in progress")
     def test_per_token_linear_cuda(self):
+        device = get_current_accelerator_device()
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
-            self._test_per_token_linear_impl(_DEVICE, dtype)
+            self._test_per_token_linear_impl(device, dtype)
 
     @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
     def test__int_mm(self):
@@ -320,8 +298,9 @@ class PythonQuantUtilOpUnitTest(unittest.TestCase):
         # if it's not already tested there
 
         m, k, n = 32, 32, 16
-        x = torch.randint(-128, 127, (m, k), dtype=torch.int8, device=_DEVICE)
-        w = torch.randint(-128, 127, (k, n), dtype=torch.int8, device=_DEVICE)
+        device = get_current_accelerator_device()
+        x = torch.randint(-128, 127, (m, k), dtype=torch.int8, device=device)
+        w = torch.randint(-128, 127, (k, n), dtype=torch.int8, device=device)
 
         y_ref = torch.matmul(x.float(), w.float()).to(torch.int32)
         y_raw = safe_int_mm(x, w)
@@ -341,7 +320,8 @@ class PythonQuantUtilOpUnitTest(unittest.TestCase):
             x = x.cpu().to(torch.int32)
             w = w.cpu().to(torch.int32)
             y = torch.matmul(x, w)
-            return y.to(_DEVICE)
+            device = get_current_accelerator_device()
+            return y.to(device)
 
         shapes = (
             # minimal test shape
@@ -369,8 +349,9 @@ class PythonQuantUtilOpUnitTest(unittest.TestCase):
                 wrap_torch_int_mm, mode="max-autotune"
             )
 
-            x = torch.randint(-128, 127, x_shape, dtype=torch.int8, device=_DEVICE)
-            w = torch.randint(-128, 127, w_shape, dtype=torch.int8, device=_DEVICE)
+            device = get_current_accelerator_device()
+            x = torch.randint(-128, 127, x_shape, dtype=torch.int8, device=device)
+            w = torch.randint(-128, 127, w_shape, dtype=torch.int8, device=device)
 
             z_ref = __int_mm_ref(x, w)
             z_eager = wrap_torch_int_mm(x, w)
@@ -623,32 +604,6 @@ class TestSubclass(unittest.TestCase):
         )
 
     @parameterized.expand(COMMON_DEVICE_DTYPE)
-    @skip_if_xpu("XPU enablement in progress")
-    def test_int4_weight_only_quant_subclass_api(self, device, dtype):
-        if dtype != torch.bfloat16:
-            self.skipTest(f"Fails for {dtype}")
-        for test_shape in [(16, 1024, 16)] + (
-            [(1, 1024, 256)] if device == _DEVICE else []
-        ):
-            self._test_lin_weight_subclass_api_impl(
-                _int4wo_api, device, 15, test_shape=test_shape, test_dtype=dtype
-            )
-
-    @parameterized.expand(COMMON_DEVICE_DTYPE)
-    @skip_if_xpu("XPU enablement in progress")
-    def test_int4_weight_only_hqq_quant_subclass_api(self, device, dtype):
-        if dtype != torch.bfloat16:
-            self.skipTest(f"Fails for {dtype}")
-        for test_shape in [(16, 1024, 16), (1, 1024, 256)]:
-            api = partial(
-                _int4wo_api,
-                use_hqq=True,
-            )
-            self._test_lin_weight_subclass_api_impl(
-                api, device, 15, test_shape=test_shape, test_dtype=dtype
-            )
-
-    @parameterized.expand(COMMON_DEVICE_DTYPE)
     @unittest.skipIf(not has_gemlite, "gemlite not available")
     def test_gemlite_layout(self, device, dtype):
         from torchao.quantization import GemliteUIntXWeightOnlyConfig
@@ -698,34 +653,27 @@ class TestSubclass(unittest.TestCase):
     def test_int4_weight_only_quant_subclass_api_grouped(self, device, dtype):
         if dtype != torch.bfloat16:
             self.skipTest(f"Fails for {dtype}")
-        layout_list = []
-        if check_cpu_version(device):
-            layout_list.append(Int4CPULayout())
-        elif check_xpu_version(device):
-            layout_list.append(Int4XPULayout())
-        else:
-            for inner_k_tiles in [4, 2]:
-                layout_list.append(TensorCoreTiledLayout(inner_k_tiles=inner_k_tiles))
-        for test_shape in [(256, 256, 16)] + (
-            [(256, 256, 8)] if device == _DEVICE else []
-        ):
+        if device == "cpu":
+            self.skipTest("Only CUDA is supported for int4 weight only quantization v2")
+        for test_shape in [(256, 256, 16), (256, 256, 8)]:
             for groupsize in [64, 32]:
-                for layout in layout_list:
-                    kwargs = {"groupsize": groupsize, "layout": layout, "version": 1}
 
-                    def api(mod):
-                        kwargs_copy = kwargs.copy()
-                        kwargs_copy["group_size"] = groupsize
-                        del kwargs_copy["groupsize"]
-                        quantize_(mod, Int4WeightOnlyConfig(**kwargs_copy))
-
-                    self._test_lin_weight_subclass_api_impl(
-                        api,
-                        device,
-                        15,
-                        test_shape=test_shape,
-                        test_dtype=dtype,
+                def api(mod):
+                    quantize_(
+                        mod,
+                        Int4WeightOnlyConfig(
+                            group_size=groupsize,
+                            int4_packing_format=Int4PackingFormat.TILE_PACKED_TO_4D,
+                        ),
                     )
+
+                self._test_lin_weight_subclass_api_impl(
+                    api,
+                    device,
+                    15,
+                    test_shape=test_shape,
+                    test_dtype=dtype,
+                )
 
 
 class TestDynamicQuant(unittest.TestCase):
@@ -789,7 +737,7 @@ class TestWeightOnlyInt8Quant(unittest.TestCase):
     @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
     def test_weight_only_quant_force_mixed_mm(self, device, dtype):
         undo_recommended_configs()
-        if device != _DEVICE:
+        if device != get_current_accelerator_device():
             self.skipTest(
                 f"weight_only_quant_force_mixed_mm can't be constructed on {device}"
             )
@@ -825,7 +773,7 @@ class TestWeightOnlyInt8Quant(unittest.TestCase):
     @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
     def test_weight_only_quant_use_mixed_mm(self, device, dtype):
         undo_recommended_configs()
-        if device != _DEVICE:
+        if device != get_current_accelerator_device():
             self.skipTest(
                 f"weight_only_quant_force_mixed_mm can't be constructed on {device}"
             )
@@ -943,13 +891,6 @@ class TestSaveLoadMeta(unittest.TestCase):
         undo_recommended_configs()
         self._test_handle_save_load_meta_impl(_int8wo_api, device, test_dtype=dtype)
 
-    @parameterized.expand(COMMON_DEVICE_DTYPE)
-    @torch.no_grad()
-    def test_save_load_int4woqtensors(self, device, dtype):
-        if dtype != torch.bfloat16:
-            self.skipTest(f"Fails for {dtype}")
-        self._test_handle_save_load_meta_impl(_int4wo_api, device, 20, test_dtype=dtype)
-
 
 class UtilsUnitTest(unittest.TestCase):
     def test_shape_logger(self):
@@ -990,9 +931,11 @@ class TestAutoQuant(unittest.TestCase):
             ],
         )
     )
+    @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
     def test_autoquant_one_input(self, device, dtype, m, k, n):
         undo_recommended_configs()
         print("(m, k, n): ", (m, k, n))
+        _DEVICE = get_current_accelerator_device()
         if device != _DEVICE or not torch.accelerator.is_available():
             self.skipTest(f"autoquant currently does not support {device}")
         if torch.cuda.is_available() and torch.cuda.get_device_capability() < (8, 0):
@@ -1031,9 +974,11 @@ class TestAutoQuant(unittest.TestCase):
             ],
         )
     )
+    @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
     def test_autoquant_compile(self, device, dtype, m1, m2, k, n):
         undo_recommended_configs()
 
+        _DEVICE = get_current_accelerator_device()
         is_supported_device = device == _DEVICE and (
             torch.accelerator.is_available() or torch.version.hip is not None
         )
@@ -1081,7 +1026,9 @@ class TestAutoQuant(unittest.TestCase):
         self.assertTrue(sqnr >= 30)
 
     @parameterized.expand(COMMON_DEVICE_DTYPE)
+    @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
     def test_autoquant_mha(self, device, dtype):
+        _DEVICE = get_current_accelerator_device()
         if device != _DEVICE or not torch.accelerator.is_available():
             self.skipTest(f"autoquant currently does not support {device}")
 
@@ -1108,8 +1055,10 @@ class TestAutoQuant(unittest.TestCase):
         assert len(_AUTOQUANT_CACHE) > 0
 
     @parameterized.expand(COMMON_DEVICE_DTYPE)
+    @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
     def test_autoquant_manual(self, device, dtype):
         undo_recommended_configs()
+        _DEVICE = get_current_accelerator_device()
         if device != _DEVICE or not torch.accelerator.is_available():
             self.skipTest(f"autoquant currently does not support {device}")
         if torch.cuda.is_available() and torch.cuda.get_device_capability() < (8, 0):
@@ -1157,8 +1106,10 @@ class TestAutoQuant(unittest.TestCase):
             ],
         )
     )
+    @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
     def test_autoquant_kwargs(self, device, dtype, m1, m2, k, n):
         undo_recommended_configs()
+        _DEVICE = get_current_accelerator_device()
         if device != _DEVICE or not torch.accelerator.is_available():
             self.skipTest(f"autoquant currently does not support {device}")
         if torch.cuda.is_available() and torch.cuda.get_device_capability() < (8, 0):
@@ -1221,8 +1172,10 @@ class TestAutoQuant(unittest.TestCase):
             ],
         )
     )
+    @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
     def test_autoquant_double_access(self, device, dtype, m, k, n):
         undo_recommended_configs()
+        _DEVICE = get_current_accelerator_device()
         if device != _DEVICE or not torch.accelerator.is_available():
             self.skipTest(f"autoquant currently does not support {device}")
         if torch.cuda.is_available() and torch.cuda.get_device_capability() < (8, 0):
@@ -1250,7 +1203,7 @@ class TestAutoQuant(unittest.TestCase):
         assert not isinstance(model.lin1.weight.weight, AutoQuantizableLinearWeight)
         model(x_in)
 
-    @parameterized.expand(list(itertools.product([_DEVICE], COMMON_DTYPES)))
+    @parameterized.expand(list(itertools.product(COMMON_DEVICES, COMMON_DTYPES)))
     @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
     def test_autoquant_min_sqnr(self, device, dtype):
         m, k, n = 128, 128, 128
@@ -1314,7 +1267,6 @@ class TestAutoQuant(unittest.TestCase):
         for qclass in [
             AQGemliteInt4G64WeightOnlyQuantizedLinearWeight,
             AQInt4G32WeightOnlyQuantizedLinearWeight,
-            AQInt4G128WeightOnlyQuantizedMarlinSparseLinearWeight,
         ]:
             model = (
                 torch.nn.Sequential(
@@ -1348,7 +1300,6 @@ class TestAutoQuant(unittest.TestCase):
         if device == "cpu":
             self.skipTest(f"float8 is for cuda, not {device}")
 
-        # note: marlin sparse layout failed when scale_t has a dimension of 1d
         m, k, n = 128, 128, 128
         example_input = torch.randn(m, k, device=device, dtype=dtype)
 
@@ -1515,8 +1466,8 @@ class TestExport(unittest.TestCase):
             def forward(self, x):
                 return self.linear(x)
 
-        model = SimpleNetwork().eval().to(_DEVICE)
-        inp = torch.randn(2, 32).to(_DEVICE)
+        model = SimpleNetwork().eval().to("cuda")
+        inp = torch.randn(2, 32).to("cuda")
         config = Float8DynamicActivationFloat8WeightConfig()
         quantize_(model, config)
 
@@ -1533,9 +1484,11 @@ class TestUtils(unittest.TestCase):
     @parameterized.expand(
         list(itertools.product(TENSOR_SUBCLASS_APIS, COMMON_DEVICES, COMMON_DTYPES)),
     )
+    @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
     def test_get_model_size_aqt(self, api, test_device, test_dtype):
         if test_dtype != torch.bfloat16:
             self.skipTest(f"{api} in {test_dtype} is not supported yet")
+        _DEVICE = get_current_accelerator_device()
         if test_device != _DEVICE or not torch.accelerator.is_available():
             self.skipTest(f"{api} currently does not support {test_device}")
         k, n = 1024, 1024
@@ -1585,7 +1538,8 @@ class TestBenchmarkModel(unittest.TestCase):
 
     @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
     def test_benchmark_model_cuda(self):
-        assert self.run_benchmark_model(_DEVICE) is not None
+        device = get_current_accelerator_device()
+        assert self.run_benchmark_model(device) is not None
 
     def test_benchmark_model_cpu(self):
         assert self.run_benchmark_model("cpu") is not None

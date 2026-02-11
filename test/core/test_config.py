@@ -22,7 +22,6 @@ from torchao.core.config import (
 )
 from torchao.prototype.awq import (
     AWQConfig,
-    AWQStep,
 )
 from torchao.quantization import (
     PerBlock,
@@ -33,9 +32,7 @@ from torchao.quantization.quant_api import (
     Float8DynamicActivationFloat8WeightConfig,
     Float8DynamicActivationInt4WeightConfig,
     Float8WeightOnlyConfig,
-    FPXWeightOnlyConfig,
     GemliteUIntXWeightOnlyConfig,
-    Int4DynamicActivationInt4WeightConfig,
     Int4WeightOnlyConfig,
     Int8DynamicActivationInt4WeightConfig,
     Int8DynamicActivationInt8WeightConfig,
@@ -44,6 +41,7 @@ from torchao.quantization.quant_api import (
     UIntXWeightOnlyConfig,
     quantize_,
 )
+from torchao.quantization.quantize_.common.quantization_step import QuantizationStep
 from torchao.sparsity.sparse_api import BlockSparseWeightConfig, SemiSparseWeightConfig
 from torchao.utils import is_sm_at_least_89
 
@@ -60,7 +58,6 @@ configs = [
     ),
     UIntXWeightOnlyConfig(dtype=torch.uint1),
     Float8DynamicActivationInt4WeightConfig(),
-    Int4DynamicActivationInt4WeightConfig(),
     Int4WeightOnlyConfig(
         group_size=32,
     ),
@@ -87,7 +84,6 @@ configs = [
         group_size=128,  # Optional, has default of 64
         bit_width=8,  # Optional, has default of 4
     ),
-    FPXWeightOnlyConfig(ebits=4, mbits=8),
     # Sparsity configs
     SemiSparseWeightConfig(),
     BlockSparseWeightConfig(blocksize=128),
@@ -99,7 +95,9 @@ configs = [
             "linear2": Int8DynamicActivationInt4WeightConfig(),
         }
     ),
-    AWQConfig(Int4WeightOnlyConfig(group_size=128), step=AWQStep.PREPARE_FOR_LOADING),
+    AWQConfig(
+        Int4WeightOnlyConfig(group_size=128), step=QuantizationStep.PREPARE_FOR_LOADING
+    ),
     AWQConfig(Int4WeightOnlyConfig(group_size=128), step="prepare_for_loading"),
 ]
 

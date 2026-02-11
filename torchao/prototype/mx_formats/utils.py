@@ -160,7 +160,10 @@ def _to_mxfp8_dim1_kernel_wrapper(
     from torchao.prototype.mx_formats.mx_tensor import MXTensor
 
     if cast_kernel_choice == MXFP8Dim1CastKernelChoice.TRITON:
-        assert scale_calculation_mode == ScaleCalculationMode.FLOOR
+        assert scale_calculation_mode in (
+            ScaleCalculationMode.FLOOR,
+            ScaleCalculationMode.RCEIL,
+        )
         a_data, a_scale = triton_to_mxfp8_dim1(a, block_size)
     elif cast_kernel_choice == MXFP8Dim1CastKernelChoice.CUDA:
         assert scale_calculation_mode in (
@@ -228,7 +231,7 @@ def _swizzle_aware_slice(
     # it back to the format which matches the shape of `qdata`.
     # TODO(future PR): update this
 
-    if x._is_swizzled_scales:
+    if x.is_swizzled_scales:
         scale_rows = M
         scale_cols = K // x.block_size
         n_row_blocks = ceil_div(scale_rows, 128)
@@ -395,7 +398,7 @@ def _swizzle_aware_slice(
     else:
         # multiply by 2 to convert from bytes to num_elements
         sliced_K = sliced_data.shape[1] * 2
-    if x._is_swizzled_scales:
+    if x.is_swizzled_scales:
         if x.block_size == 16:
             scale_M, scale_K = hp_data_dims_to_swizzled_scale_dims_nvfp4(
                 sliced_M, sliced_K

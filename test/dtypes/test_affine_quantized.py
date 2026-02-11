@@ -16,9 +16,6 @@ from torch.testing._internal.common_utils import (
 
 from torchao.core.config import AOBaseConfig
 from torchao.dtypes import (
-    CutlassInt4PackedLayout,
-    Int4CPULayout,
-    Int4XPULayout,
     PlainLayout,
     SemiSparseLayout,
     to_affine_quantized_intx,
@@ -27,32 +24,28 @@ from torchao.dtypes import (
 from torchao.quantization import (
     Float8WeightOnlyConfig,
     GemliteUIntXWeightOnlyConfig,
-    Int4DynamicActivationInt4WeightConfig,
-    Int4WeightOnlyConfig,
     Int8DynamicActivationInt4WeightConfig,
     Int8DynamicActivationInt8WeightConfig,
     Int8WeightOnlyConfig,
     quantize_,
 )
-from torchao.quantization.quant_primitives import MappingType, ZeroPointDomain
-from torchao.testing.utils import skip_if_no_cuda, skip_if_no_gemlite, skip_if_rocm
+from torchao.quantization.quant_primitives import MappingType
+from torchao.testing.utils import skip_if_no_gemlite, skip_if_rocm
 from torchao.utils import (
     check_cpu_version,
     check_xpu_version,
     get_current_accelerator_device,
     is_fbcode,
-    is_ROCM,
     is_sm_at_least_89,
 )
 
 is_cusparselt_available = (
     hasattr(torch.backends, "cusparselt") and torch.backends.cusparselt.is_available()
 )
-_DEVICE = get_current_accelerator_device()
 
 
 def get_quantization_functions(
-    do_sparse: bool, do_int4: bool, device: str = _DEVICE, int4_zp_int: bool = False
+    do_sparse: bool, do_int4: bool, device: str = "cuda", int4_zp_int: bool = False
 ):
     base_functions = [
         Int8WeightOnlyConfig(),
@@ -62,34 +55,9 @@ def get_quantization_functions(
     ]
     if do_int4:
         if check_cpu_version(device):
-            base_functions.append(
-                Int4WeightOnlyConfig(group_size=32, layout=Int4CPULayout(), version=1)
-            )
+            pass
         elif check_xpu_version(device):
-            base_functions.append(
-                Int4WeightOnlyConfig(group_size=32, layout=Int4XPULayout(), version=1)
-            )
-            if int4_zp_int:
-                base_functions.append(
-                    Int4WeightOnlyConfig(
-                        group_size=32,
-                        layout=Int4XPULayout(),
-                        zero_point_domain=ZeroPointDomain.INT,
-                        version=1,
-                    )
-                )
-        else:
-            base_functions.append(Int4WeightOnlyConfig(group_size=32, version=1))
-            if device == "cuda" and not is_ROCM():
-                base_functions.append(
-                    Int8DynamicActivationInt4WeightConfig(
-                        group_size=None,
-                        mapping_type=MappingType.SYMMETRIC,
-                        act_mapping_type=MappingType.SYMMETRIC,
-                        layout=CutlassInt4PackedLayout(),
-                    )
-                )
-                base_functions.append(Int4DynamicActivationInt4WeightConfig())
+            pass
 
     if do_sparse and device != "xpu":
         base_functions.append(
@@ -106,26 +74,7 @@ class TestAffineQuantized(TestCase):
     GPU_DEVICES = (["cuda"] if torch.cuda.is_available() else []) + (
         ["xpu"] if torch.xpu.is_available() else []
     )
-
-    @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
-    def test_tensor_core_layout_transpose(self):
-        linear = torch.nn.Linear(128, 256, dtype=torch.bfloat16, device=_DEVICE)
-        t = linear.weight
-        shape = t.shape
-        apply_int4_weight_only_quant = Int4WeightOnlyConfig(group_size=32, version=1)
-        quantize_(linear, apply_int4_weight_only_quant)
-        ql = linear
-        aqt = ql.weight
-        aqt_shape = aqt.shape
-        self.assertEqual(aqt_shape, shape)
-
-        # transpose shape test
-        for _ in range(10):
-            t = t.t()
-            aqt = aqt.t()
-            shape = t.shape
-            aqt_shape = aqt.shape
-            self.assertEqual(aqt_shape, shape)
+    _DEVICE = get_current_accelerator_device() if len(GPU_DEVICES) != 0 else "cpu"
 
     @unittest.skipIf(len(GPU_DEVICES) == 0, "Need GPU available")
     def test_weights_only(self):
@@ -147,7 +96,9 @@ class TestAffineQuantized(TestCase):
                     _ = torch.load(f, weights_only=True)
 
     @unittest.skipIf(len(GPU_DEVICES) == 0, "Need GPU available")
-    @common_utils.parametrize("apply_quant", get_quantization_functions(False, False))
+    @common_utils.parametrize(
+        "apply_quant", get_quantization_functions(False, False, _DEVICE)
+    )
     def test_to_device(self, apply_quant):
         for device in self.GPU_DEVICES:
 
@@ -208,10 +159,11 @@ class TestAffineQuantized(TestCase):
             )
             return linear
 
-        linear = torch.nn.Linear(128, 256, dtype=torch.bfloat16, device=_DEVICE)
+        device = get_current_accelerator_device()
+        linear = torch.nn.Linear(128, 256, dtype=torch.bfloat16, device=device)
         apply_uint6_weight_only_quant(linear)
 
-        example_input = torch.randn(1, 128, dtype=torch.bfloat16, device=_DEVICE)
+        example_input = torch.randn(1, 128, dtype=torch.bfloat16, device=device)
         with self.assertRaisesRegex(
             AssertionError, "dispatching to my impl for uint6 weight only quant"
         ):
@@ -239,8 +191,9 @@ class TestAffineQuantized(TestCase):
         "apply_quant", get_quantization_functions(False, True, _DEVICE, False)
     )
     def test_test_copy__apply(self, apply_quant):
-        linear = torch.nn.Linear(128, 256, dtype=torch.bfloat16, device=_DEVICE)
-        linear2 = torch.nn.Linear(128, 256, dtype=torch.bfloat16, device=_DEVICE)
+        device = get_current_accelerator_device()
+        linear = torch.nn.Linear(128, 256, dtype=torch.bfloat16, device=device)
+        linear2 = torch.nn.Linear(128, 256, dtype=torch.bfloat16, device=device)
 
         if isinstance(apply_quant, AOBaseConfig):
             quantize_(linear, apply_quant)
@@ -251,7 +204,7 @@ class TestAffineQuantized(TestCase):
             ql = apply_quant(linear)
             ql2 = apply_quant(linear2)
 
-        example_input = torch.randn(1, 128, dtype=torch.bfloat16, device=_DEVICE)
+        example_input = torch.randn(1, 128, dtype=torch.bfloat16, device=device)
         output = ql(example_input)
         ql2.weight.copy_(ql.weight)
         ql2.bias = ql.bias
@@ -263,8 +216,9 @@ class TestAffineQuantized(TestCase):
         "apply_quant", get_quantization_functions(False, True, _DEVICE, False)
     )
     def test_copy__mismatch_metadata(self, apply_quant):
-        linear = torch.nn.Linear(128, 256, dtype=torch.bfloat16, device=_DEVICE)
-        linear2 = torch.nn.Linear(128, 512, dtype=torch.bfloat16, device=_DEVICE)
+        devcie = get_current_accelerator_device()
+        linear = torch.nn.Linear(128, 256, dtype=torch.bfloat16, device=devcie)
+        linear2 = torch.nn.Linear(128, 512, dtype=torch.bfloat16, device=devcie)
 
         if isinstance(apply_quant, AOBaseConfig):
             quantize_(linear, apply_quant)
@@ -338,21 +292,7 @@ class TestAffineQuantizedBasic(TestCase):
         quantize_(dummy, Int8DynamicActivationInt8WeightConfig())
         _ = dummy.weight[...]
 
-    @common_utils.parametrize("device", [_DEVICE])
-    @common_utils.parametrize("dtype", [torch.bfloat16])
-    @skip_if_no_cuda()
-    @skip_if_rocm("ROCm enablement in progress")
-    def test_slice_int4wo(self, device, dtype):
-        # in_feature not divisible by 1024
-        # out_feature not divisible by 8
-        # to test slice + padding for int4 weight only quantization
-        dummy = nn.Linear(256, 321, dtype=dtype, device=device)
-        quantize_(dummy, Int4WeightOnlyConfig(version=1))
-        # make sure these run without error
-        _ = dummy.weight.narrow(0, 0, 64)
-        _ = dummy.weight.narrow(1, 0, 128)
-
-    @common_utils.parametrize("device", [_DEVICE])
+    @common_utils.parametrize("device", ["cuda"])
     @common_utils.parametrize("dtype", [torch.float16, torch.bfloat16])
     @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
     @skip_if_no_gemlite()
@@ -435,7 +375,8 @@ class TestAffineQuantizedBasic(TestCase):
             )
             self.assertEqual((W_slice_ref - W_slice).abs().mean().item(), 0)
 
-    @common_utils.parametrize("device", [_DEVICE])
+    @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
+    @common_utils.parametrize("device", COMMON_DEVICES)
     @common_utils.parametrize("dtype", [torch.bfloat16])
     def test_matmul(self, device, dtype):
         x = torch.randn(53, 2048)
@@ -451,58 +392,6 @@ class TestAffineQuantizedBasic(TestCase):
         )
         # make sure it runs
         torch.matmul(x, w.t())
-
-    @common_utils.parametrize("device", [_DEVICE])
-    @common_utils.parametrize("dtype", [torch.bfloat16])
-    @skip_if_no_cuda()
-    @skip_if_rocm("ROCm enablement in progress")
-    def test_slice_and_copy_int4wo(self, device, dtype):
-        l = torch.nn.Linear(1024, 1024).to(_DEVICE).to(torch.bfloat16)
-        l.weight = torch.nn.Parameter(
-            torch.zeros(1024, 1024, dtype=torch.bfloat16, device=_DEVICE)
-        )
-        quantize_(l, Int4WeightOnlyConfig(version=1))
-        param = l.weight
-        param_data = param.data
-        param_data = param_data.narrow(0, 0, 512)
-        assert (
-            param.data.tensor_impl.packed_weight.data_ptr()
-            == param_data.tensor_impl.packed_weight.data_ptr()
-        )
-        assert (
-            param.data.tensor_impl.scale_and_zero.data_ptr()
-            == param_data.tensor_impl.scale_and_zero.data_ptr()
-        )
-        assert param.data.dequantize()[0][0] == 0
-
-        # dummy_l has random input (shouldn't be 0)
-        dummy_l = torch.nn.Linear(1024, 1024).to(_DEVICE).to(torch.bfloat16)
-        quantize_(dummy_l, Int4WeightOnlyConfig(version=1))
-        quantized = dummy_l.weight
-        quantized = quantized.narrow(0, 0, 512)
-
-        param_data.copy_(quantized)
-
-        # making sure param.data is updated
-        assert param.data.dequantize()[0][0] != 0
-
-    @common_utils.parametrize("device", [_DEVICE])
-    @common_utils.parametrize("dtype", [torch.bfloat16])
-    @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
-    @skip_if_rocm("ROCm enablement in progress")
-    def test_mm_int4wo(self, device, dtype):
-        weight = torch.randn(512, 1024).to(device).to(dtype)
-        weight = weight.t()
-
-        l = torch.nn.Linear(512, 1024).to(device).to(dtype)
-        l.weight = torch.nn.Parameter(weight)
-        quantize_(l, Int4WeightOnlyConfig(version=1))
-        # weight shape: 1024 x 512
-        weight = l.weight
-
-        input = torch.randn(1, 512, device=device, dtype=dtype)
-        # make sure it runs
-        torch.nn.functional.linear(input, weight)
 
 
 common_utils.instantiate_parametrized_tests(TestAffineQuantized)
